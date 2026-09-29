@@ -34,8 +34,10 @@ def test_monthly_total_mixed_states():
         _svc(ServiceType.KTV, ServiceState.SERVICE, "0"),
         _svc(ServiceType.CTV, ServiceState.SERVICE, "300"),
     ]
-    assert monthly_total(services) == Decimal("1000.00")
-    assert monthly_total_full(services) == Decimal("950.00")
+    # monthly_total: Internet SERVICE 500 + Internet ДБ 50 + КТВ SERVICE 50 + ЦТВ 300
+    assert monthly_total(services) == Decimal("900.00")
+    # monthly_total_full: только неблокированные: Internet 500 + КТВ 50 + ЦТВ 300
+    assert monthly_total_full(services) == Decimal("850.00")
 
 
 def test_paid_until_matches_tz_example():

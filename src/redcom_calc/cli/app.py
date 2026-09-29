@@ -15,7 +15,11 @@ from ..domain.calculations import (
     validate_price,
 )
 from ..domain.models import BlockType, Service, ServiceState, ServiceType
-from ..domain.rules import monthly_rate_for_state
+from ..domain.rules import (
+    KTV_BLOCK_RATE,
+    KTV_MONTHLY_RATE,
+    monthly_rate_for_state,
+)
 
 _TYPE_LABELS: dict[ServiceType, str] = {
     ServiceType.INTERNET: "Интернет",
@@ -163,7 +167,11 @@ def _prompt_service() -> Service:
         )
 
     if type_ is ServiceType.KTV:
-        monthly_fee = Decimal(150)
+        # КТВ: 50 ₽ без блока, 150 ₽ в блоке — по правилам компании.
+        if state is ServiceState.BLOCK:
+            monthly_fee = KTV_BLOCK_RATE
+        else:
+            monthly_fee = KTV_MONTHLY_RATE
     else:
         monthly_fee = _prompt_decimal("Тариф (₽/мес)")
 

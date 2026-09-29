@@ -12,7 +12,35 @@ from redcom_calc.domain.calculations import (
     parse_days_input,
     validate_price,
 )
-from redcom_calc.domain.models import BlockType
+from redcom_calc.domain.models import (
+    BlockType,
+    Service,
+    ServiceState,
+    ServiceType,
+)
+from redcom_calc.domain.rules import monthly_rate_for_state
+
+_TYPE_LABELS: dict[ServiceType, str] = {
+    ServiceType.INTERNET: "Интернет",
+    ServiceType.CTV: "ЦТВ",
+    ServiceType.KTV: "КТВ",
+    ServiceType.INTERCOM: "Домофон",
+    ServiceType.PHONE: "Телефон",
+    ServiceType.CAMERA: "Камера",
+    ServiceType.EQUIPMENT: "Оборудование",
+}
+
+_STATE_LABELS: dict[ServiceState, str] = {
+    ServiceState.SERVICE: "Активна",
+    ServiceState.BLOCK: "Блокировка",
+    ServiceState.ATTACH: "Подключение",
+    ServiceState.CANCEL: "Отмена",
+}
+
+_BLOCK_LABELS: dict[BlockType, str] = {
+    BlockType.VOLUNTARY: "ДБ (добровольная)",
+    BlockType.FINANCIAL: "ФБ (финансовая)",
+}
 
 _MARKER = {
     BlockType.NONE: "",
@@ -32,9 +60,9 @@ def main(page: ft.Page):
     page.title = "Калькулятор абонентской платы — Рэдком"
     page.theme_mode = ft.ThemeMode.SYSTEM
     page.padding = 24
-    page.window.width = 900
-    page.window.height = 920
-    page.window.min_width = 760
+    page.window.width = 980
+    page.window.height = 980
+    page.window.min_width = 820
     page.window.min_height = 700
     page.scroll = ft.ScrollMode.AUTO
 
@@ -93,12 +121,23 @@ def main(page: ft.Page):
     mode_radio = ft.RadioGroup(
         value="prorated",
         on_change=on_mode_change,
-        content=ft.Row(
+        content=ft.Column(
             [
-                ft.Radio(value="total", label="Знаю итоговую сумму"),
-                ft.Radio(value="prorated", label="Восстановить из списания"),
+                ft.Row(
+                    [
+                        ft.Radio(value="total", label="Знаю итоговую сумму"),
+                        ft.Radio(value="prorated", label="Восстановить из списания"),
+                    ],
+                    spacing=24,
+                ),
+                ft.Row(
+                    [
+                        ft.Radio(value="services", label="Услуги с типом и списанием"),
+                    ],
+                    spacing=24,
+                ),
             ],
-            spacing=24,
+            spacing=8,
         ),
     )
 
@@ -117,12 +156,20 @@ def main(page: ft.Page):
 
     rows_column = ft.Column(spacing=8)
 
+    # --- режим total ---
+    def _build_total_row(idx: int):
+        total_field = ft.TextField(label="Абонплата в месяц, ₽", width=200)
+        return {
+            "total": total_field,
+            "row": ft.Row([total_field], spacing=12),
+        }
+
+    # --- режим prorated ---
     def _build_prorated_row(idx: int):
         name_field = ft.TextField(
             label="Услуга",
             hint_text="Интернет / Аренда / Интернет ФБ",
             width=220,
-            expand=False,
         )
         amount_field = ft.TextField(label="Сумма ₽", width=110)
         days_field = ft.TextField(
@@ -147,15 +194,80 @@ def main(page: ft.Page):
             ),
         }
 
-    def _build_total_row(idx: int):
-        total_field = ft.TextField(
-            label="Абонплата в месяц, ₽",
-            width=200,
+    # --- режим services (тип + списание + дни) ---
+    def _build_services_row(idx: int):
+        type_dd = ft.Dropdown(
+            label="Тип услуги",
+            width=170,
+            options=[
+                ft.dropdown.Option(key=t.value, text=label) for t, label in _TYPE_LABELS.items()
+            ],
+            value=ServiceType.INTERNET.value,
         )
-        return {
-            "total": total_field,
-            "row": ft.Row([total_field], spacing=12),
+        state_dd = ft.Dropdown(
+            label="Состояние",
+            width=170,
+            options=[
+                ft.dropdown.Option(key=s.value, text=label) for s, label in _STATE_LABELS.items()
+            ],
+            value=ServiceState.SERVICE.value,
+        )
+        block_dd = ft.Dropdown(
+            label="Тип блокировки",
+            width=200,
+            options=[
+                ft.dropdown.Option(key=b.value, text=label) for b, label in _BLOCK_LABELS.items()
+            ],
+            value=BlockType.VOLUNTARY.value,
+            visible=False,
+        )
+        name_field = ft.TextField(
+            label="Название",
+            width=220,
+            hint_text="опционально",
+        )
+
+        amount_field = ft.TextField(
+            label="Сумма списания, ₽",
+            width=180,
+            hint_text="что показал Fastcom",
+        )
+        days_field = ft.TextField(
+            label="Дней / коэф.",
+            width=140,
+            hint_text="28 или 0.72",
+        )
+        ym_field = ft.TextField(
+            label="Месяц",
+            value=date.today().strftime("%Y-%m"),
+            width=110,
+        )
+
+        def refresh_visibility(e=None):
+            state = ServiceState(state_dd.value)
+            block_dd.visible = state is ServiceState.BLOCK
+            page.update()
+
+        state_dd.on_change = refresh_visibility
+
+        entry = {
+            "type": type_dd,
+            "state": state_dd,
+            "block": block_dd,
+            "name": name_field,
+            "amount": amount_field,
+            "days": days_field,
+            "ym": ym_field,
         }
+        entry["row"] = ft.Column(
+            [
+                ft.Row([type_dd, state_dd, block_dd, name_field], spacing=12, wrap=True),
+                ft.Row([amount_field, days_field, ym_field], spacing=12, wrap=True),
+            ],
+            spacing=8,
+        )
+        refresh_visibility()
+        return entry
 
     def rebuild_rows():
         rows_ref.clear()
@@ -165,8 +277,11 @@ def main(page: ft.Page):
 
     def add_row(e=None):
         idx = len(rows_ref)
-        if mode_ref["value"] == "prorated":
+        m = mode_ref["value"]
+        if m == "prorated":
             entry = _build_prorated_row(idx)
+        elif m == "services":
+            entry = _build_services_row(idx)
         else:
             entry = _build_total_row(idx)
         rows_ref.append(entry)
@@ -277,6 +392,8 @@ def main(page: ft.Page):
         ),
     )
 
+    # ---------- сбор данных ----------
+
     def _collect_prorated(today: date):
         rows_blocks: list = []
         sum_regular = Decimal(0)
@@ -308,10 +425,7 @@ def main(page: ft.Page):
             total += monthly
 
             marker = _MARKER[block]
-            parts: list = [
-                ("  • ", None),
-                (f"{name}{marker}: ", None),
-            ]
+            parts: list = [("  • ", None), (f"{name}{marker}: ", None)]
             if check.was_changed:
                 parts.extend(
                     [
@@ -341,6 +455,109 @@ def main(page: ft.Page):
 
         return total, sum_regular, sum_db, sum_fb, rows_blocks
 
+    def _collect_services(today: date):
+        rows_blocks: list = []
+        sum_regular = Decimal(0)
+        sum_db = Decimal(0)
+        sum_fb = Decimal(0)
+        total = Decimal(0)
+
+        for r in rows_ref:
+            typ = ServiceType(r["type"].value)
+            state = ServiceState(r["state"].value)
+            if state is ServiceState.BLOCK:
+                block = BlockType(r["block"].value)
+            else:
+                block = BlockType.NONE
+
+            name = (r["name"].value or "").strip() or _TYPE_LABELS[typ]
+
+            amount_raw = (r["amount"].value or "").strip()
+            raw_days = (r["days"].value or "").strip()
+            ym_raw = (r["ym"].value or "").strip()
+
+            if not amount_raw:
+                raise ValueError(f"{name}: укажите сумму списания")
+
+            try:
+                amount = Decimal(amount_raw.replace(",", "."))
+            except InvalidOperation as exc:
+                raise ValueError(f"{name}: некорректная сумма") from exc
+
+            try:
+                y_s, m_s = ym_raw.split("-")
+                year, month = int(y_s), int(m_s)
+            except (ValueError, AttributeError) as exc:
+                raise ValueError(f"{name}: некорректный месяц") from exc
+
+            try:
+                days, days_warning = parse_days_input(raw_days, today, year, month)
+            except ValueError as exc:
+                raise ValueError(f"{name}: {exc}") from exc
+
+            # 1. Восстановить ставку из списания Fastcom
+            monthly_from_fastcom = monthly_from_prorated(amount, days, year, month)
+            check = validate_price(monthly_from_fastcom)
+            monthly_rounded = check.rounded
+
+            # 2. Применить правила (фиксы): КТВ 50/150, домофон 100, телефон 180, ЦТВ в блоке 0, Интернет в блоке 50/150
+            temp_svc = Service(
+                type=typ,
+                monthly_fee=monthly_rounded,
+                state=state,
+                block_type=block,
+                name=name,
+            )
+            monthly_final = monthly_rate_for_state(temp_svc)
+            rules_applied = monthly_final != monthly_rounded
+
+            total += monthly_final
+
+            marker = _MARKER[block]
+            parts: list = [("  • ", None), (f"{name}{marker}: ", None)]
+
+            if rules_applied:
+                # Применён фикс — показываем исходное Fastcom, валидацию и фикс
+                parts.extend(
+                    [
+                        (f"{check.original}", _COLOR_RED),
+                        (" → ", None),
+                        (f"{monthly_final}", _COLOR_GREEN),
+                        (" ₽/мес", None),
+                        ("   (по правилу)", _COLOR_MUTED),
+                    ]
+                )
+            elif check.was_changed:
+                # Валидация исправила, фикса нет
+                parts.extend(
+                    [
+                        (f"{check.original}", _COLOR_RED),
+                        (" → ", None),
+                        (f"{monthly_final}", _COLOR_GREEN),
+                        (" ₽/мес", None),
+                    ]
+                )
+            else:
+                parts.append((f"{monthly_final}", None))
+                parts.append((" ₽/мес", None))
+
+            if days_warning:
+                parts.append((f"   ⚠ {days_warning}", _COLOR_ORANGE))
+
+            rows_blocks.append(parts)
+
+            if block is BlockType.NONE:
+                sum_regular += monthly_final
+            elif block is BlockType.VOLUNTARY:
+                sum_db += monthly_final
+            else:
+                sum_fb += monthly_final
+
+        if not rows_blocks:
+            raise ValueError("Не добавлено ни одной услуги.")
+
+        return total, sum_regular, sum_db, sum_fb, rows_blocks
+
     def calculate(e):
         try:
             today = datetime.strptime(date_field.value.strip(), "%Y-%m-%d").date()
@@ -353,13 +570,16 @@ def main(page: ft.Page):
             page.open(ft.SnackBar(ft.Text("Некорректный баланс.")))
             return
 
+        m = mode_ref["value"]
         try:
-            if mode_ref["value"] == "total":
+            if m == "total":
                 total = Decimal(rows_ref[0]["total"].value.strip().replace(",", "."))
                 full = total
                 sum_db = Decimal(0)
                 sum_fb = Decimal(0)
                 lines = [f"Знаю итоговую сумму: {total} ₽"]
+            elif m == "services":
+                total, full, sum_db, sum_fb, lines = _collect_services(today)
             else:
                 total, full, sum_db, sum_fb, lines = _collect_prorated(today)
         except (ValueError, InvalidOperation) as exc:
