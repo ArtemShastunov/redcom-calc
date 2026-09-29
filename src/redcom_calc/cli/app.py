@@ -11,6 +11,8 @@ from ..domain.calculations import (
     monthly_total,
     monthly_total_full,
     need_for_month,
+    parse_days_input,
+    validate_price,
 )
 from ..domain.models import BlockType, Service, ServiceState, ServiceType
 from ..domain.rules import monthly_rate_for_state
@@ -41,15 +43,8 @@ _DB_MARKERS = frozenset({"дб", "db"})
 _FB_MARKERS = frozenset({"фб", "fb"})
 
 
-# ---------- разбор метки блокировки ----------
-
 def parse_block_tag(raw: str) -> tuple[str, BlockType]:
-    """Разобрать строку услуги.
-
-    Если последний токен — маркер блокировки (ДБ/ФБ, кириллица/латиница,
-    в любом регистре), он отсекается и возвращается соответствующий
-    BlockType. Иначе — (исходная строка без краевых пробелов, NONE).
-    """
+    """Разобрать строку услуги: имя + метка ДБ/ФБ (если есть)."""
     text = raw.strip()
     if not text:
         return "без названия", BlockType.NONE
@@ -66,13 +61,18 @@ def parse_block_tag(raw: str) -> tuple[str, BlockType]:
     return text, BlockType.NONE
 
 
-# ---------- структуры ----------
-
 @dataclass
 class BreakdownRow:
     name: str
     monthly: Decimal
     block: BlockType = BlockType.NONE
+    original_monthly: Decimal | None = None
+    days_used: Decimal | None = None
+    days_warning: str | None = None
+
+    @property
+    def was_changed(self) -> bool:
+        return self.original_monthly is not None and self.original_monthly != self.monthly
 
 
 @dataclass
@@ -85,6 +85,7 @@ class CalcInput:
 
 
 # ---------- примитивы ввода ----------
+
 
 def _prompt_choice(title: str, options: list[tuple[object, str]]):
     print(f"\n{title}")
@@ -107,17 +108,6 @@ def _prompt_decimal(title: str, default: Decimal | None = None) -> Decimal:
             return Decimal(raw)
         except InvalidOperation:
             print("Некорректное число.")
-
-
-def _prompt_int(title: str, *, min_value: int = 1, default: int | None = None) -> int:
-    suffix = f" [{default}]" if default is not None else ""
-    while True:
-        raw = input(f"{title}{suffix}: ").strip()
-        if not raw and default is not None:
-            return default
-        if raw.isdigit() and int(raw) >= min_value:
-            return int(raw)
-        print(f"Введите целое число >= {min_value}.")
 
 
 def _prompt_date(title: str, default: date | None = None) -> date:
@@ -162,8 +152,6 @@ def _prompt_yes_no(title: str, *, default: bool | None = None) -> bool:
         print("Введите y/n.")
 
 
-# ---------- ввод одной услуги (режим 3) ----------
-
 def _prompt_service() -> Service:
     type_ = _prompt_choice("Тип услуги", [(t, _TYPE_LABELS[t]) for t in ServiceType])
     state = _prompt_choice("Состояние", [(s, _STATE_LABELS[s]) for s in ServiceState])
@@ -175,7 +163,7 @@ def _prompt_service() -> Service:
         )
 
     if type_ is ServiceType.KTV:
-        monthly_fee = Decimal("150")
+        monthly_fee = Decimal(150)
     else:
         monthly_fee = _prompt_decimal("Тариф (₽/мес)")
 
@@ -191,7 +179,8 @@ def _prompt_service() -> Service:
     )
 
 
-# ---------- три режима сбора CalcInput ----------
+# ---------- три режима ----------
+
 
 def _collect_by_total(today: date, balance: Decimal) -> CalcInput:
     total = _prompt_decimal("Абонплата в месяц (₽)")
@@ -240,27 +229,51 @@ def _collect_by_prorated(today: date, balance: Decimal) -> CalcInput:
         name, block = parse_block_tag(raw)
 
         amount = _prompt_decimal("Сумма списания (₽)")
-        days = _prompt_int("За сколько дней", min_value=1)
+        raw_days = input("За сколько дней / коэффициент (напр. 28 или 0.72): ").strip()
         year, month = _prompt_year_month("Месяц списания", today)
 
         try:
-            monthly = monthly_from_prorated(amount, days, year, month)
+            days, days_warning = parse_days_input(raw_days, today, year, month)
         except ValueError as exc:
             print(f"Ошибка: {exc}")
             continue
 
-        rows.append(BreakdownRow(name=name, monthly=monthly, block=block))
+        if days_warning:
+            print(f"  ⚠ {days_warning}")
+
+        try:
+            monthly_raw = monthly_from_prorated(amount, days, year, month)
+        except ValueError as exc:
+            print(f"Ошибка: {exc}")
+            continue
+
+        check = validate_price(monthly_raw)
+        rows.append(
+            BreakdownRow(
+                name=name,
+                monthly=check.rounded,
+                block=block,
+                original_monthly=check.original if check.was_changed else None,
+                days_used=days,
+                days_warning=days_warning,
+            )
+        )
+
         marker = {
             BlockType.NONE: "",
             BlockType.VOLUNTARY: " [ДБ]",
             BlockType.FINANCIAL: " [ФБ]",
         }[block]
-        print(f"  → {name}{marker}: {monthly} ₽/мес")
+
+        if check.was_changed:
+            print(f"  → {name}{marker}: было {check.original}, принято {check.rounded} ₽/мес")
+        else:
+            print(f"  → {name}{marker}: {check.rounded} ₽/мес")
 
     if not rows:
         raise ValueError("Не добавлено ни одной строки — считать нечего.")
 
-    total = sum((r.monthly for r in rows), Decimal("0"))
+    total = sum((r.monthly for r in rows), Decimal(0))
     return CalcInput(
         today=today,
         balance=balance,
@@ -291,29 +304,34 @@ def _print_result(inp: CalcInput) -> None:
     if inp.breakdown:
         sum_regular = sum(
             (r.monthly for r in inp.breakdown if r.block is BlockType.NONE),
-            Decimal("0"),
+            Decimal(0),
         )
         sum_db = sum(
             (r.monthly for r in inp.breakdown if r.block is BlockType.VOLUNTARY),
-            Decimal("0"),
+            Decimal(0),
         )
         sum_fb = sum(
             (r.monthly for r in inp.breakdown if r.block is BlockType.FINANCIAL),
-            Decimal("0"),
+            Decimal(0),
         )
 
         print("\nРазбивка:")
         for row in inp.breakdown:
             marker = _MARKER[row.block]
-            print(f"  • {row.name:<30} {marker:<6} → {row.monthly:>10} ₽/мес")
+            line = f"  • {row.name:<30} {marker:<6} → {row.monthly:>10} ₽/мес"
+            if row.was_changed:
+                line += f"   (было {row.original_monthly})"
+            print(line)
+            if row.days_warning:
+                print(f"      ⚠ {row.days_warning}")
 
         print()
-        print(f"  Абонентская плата (без блокировок): {sum_regular:>10} ₽")
+        print(f"Полная абонентская плата:  {sum_regular:>10} ₽")
         if sum_db > 0:
-            print(f"  Сумма за ДБ:                        {sum_db:>10} ₽")
+            print(f"Сумма за ДБ:               {sum_db:>10} ₽")
         if sum_fb > 0:
-            print(f"  Сумма за ФБ:                        {sum_fb:>10} ₽")
-        print(f"  Всего в месяц:                      {inp.total:>10} ₽")
+            print(f"Сумма за ФБ:               {sum_fb:>10} ₽")
+        print(f"Всего в месяц:             {inp.total:>10} ₽")
 
     print(f"\nДата расчёта:              {inp.today.isoformat()}")
     print(f"Баланс:                    {inp.balance:>10} ₽")
