@@ -4,15 +4,20 @@ from decimal import Decimal
 import pytest
 
 from redcom_calc.domain.calculations import (
+    BreakdownRow,
+    assign_periods,
     calculate_paid_until,
+    compute_totals,
     days_left,
     is_nice_price,
     monthly_from_prorated,
     monthly_total,
     monthly_total_full,
     need_for_month,
+    paid_until_from_breakdown,
     parse_days_input,
     round_to_nice,
+    validate_intervals,
     validate_price,
 )
 from redcom_calc.domain.models import BlockType, Service, ServiceState, ServiceType
@@ -27,6 +32,9 @@ def _svc(type_, state, fee, block=BlockType.NONE):
     )
 
 
+# ---------- базовые ----------
+
+
 def test_monthly_total_mixed_states():
     services = [
         _svc(ServiceType.INTERNET, ServiceState.SERVICE, "500"),
@@ -34,9 +42,7 @@ def test_monthly_total_mixed_states():
         _svc(ServiceType.KTV, ServiceState.SERVICE, "0"),
         _svc(ServiceType.CTV, ServiceState.SERVICE, "300"),
     ]
-    # monthly_total: Internet SERVICE 500 + Internet ДБ 50 + КТВ SERVICE 50 + ЦТВ 300
     assert monthly_total(services) == Decimal("900.00")
-    # monthly_total_full: только неблокированные: Internet 500 + КТВ 50 + ЦТВ 300
     assert monthly_total_full(services) == Decimal("850.00")
 
 
@@ -182,21 +188,18 @@ def test_parse_days_integer():
 
 
 def test_parse_days_coefficient_typical():
-    # Коэффициент 0.72 в сентябре (30 дней) → 21.6 дня
     days, warning = parse_days_input("0.72", date(2026, 9, 25), 2026, 9)
     assert days == Decimal("21.600")
     assert warning is None
 
 
 def test_parse_days_coefficient_equipment():
-    # Коэффициент 0.839294 в сентябре → 25.17882 дня
     days, warning = parse_days_input("0.839294", date(2026, 9, 25), 2026, 9)
     assert days == Decimal("25.178820")
     assert warning is None
 
 
 def test_parse_days_coefficient_tiny():
-    # Коэффициент 0.024 в сентябре → 0.72 дня
     days, warning = parse_days_input("0.024", date(2026, 9, 25), 2026, 9)
     assert days == Decimal("0.720")
     assert warning is None
@@ -252,11 +255,10 @@ def test_parse_days_too_many_rejected():
         parse_days_input("31", date(2026, 9, 25), 2026, 9)
 
 
-# ---------- интеграционные: коэффициент → месячная ставка ----------
+# ---------- интеграционные ----------
 
 
 def test_rent_125_coeff_0839_gives_150():
-    # Аренда 125 ₽ за коэффициент 0.839294, сентябрь → ≈ 150 ₽/мес
     days, _ = parse_days_input("0.839294", date(2026, 9, 25), 2026, 9)
     monthly = monthly_from_prorated(Decimal(125), days, 2026, 9)
     check = validate_price(monthly)
@@ -264,7 +266,6 @@ def test_rent_125_coeff_0839_gives_150():
 
 
 def test_rent_1_coeff_0024_gives_1():
-    # Аренда 0.024 ₽ за коэффициент 0.024, сентябрь → 1 ₽/мес
     days, _ = parse_days_input("0.024", date(2026, 9, 25), 2026, 9)
     monthly = monthly_from_prorated(Decimal("0.024"), days, 2026, 9)
     check = validate_price(monthly)
@@ -272,8 +273,193 @@ def test_rent_1_coeff_0024_gives_1():
 
 
 def test_internet_400_28_days():
-    # Интернет 400 ₽ за 28 дней, сентябрь → 428.57 → 450 ₽/мес
     days, _ = parse_days_input("28", date(2026, 9, 25), 2026, 9)
     monthly = monthly_from_prorated(Decimal(400), days, 2026, 9)
     check = validate_price(monthly)
     assert check.rounded == Decimal(450)
+
+
+# ---------- интервалы ----------
+
+
+def _interval_row(name, monthly, days, year, month, block=BlockType.NONE):
+    return BreakdownRow(
+        name=name,
+        monthly=Decimal(monthly),
+        block=block,
+        days=Decimal(days),
+        year=year,
+        month=month,
+    )
+
+
+def test_validate_intervals_ok():
+    rows = [
+        _interval_row("Интернет", "600", "15", 2026, 9),
+        _interval_row("Интернет", "900", "15", 2026, 9),
+    ]
+    validate_intervals(rows)
+
+
+def test_validate_intervals_mismatch():
+    rows = [
+        _interval_row("Интернет", "600", "14", 2026, 9),
+    ]
+    with pytest.raises(ValueError) as exc:
+        validate_intervals(rows)
+    assert "Интернет" in str(exc.value)
+
+
+def test_validate_intervals_no_days_ok():
+    rows = [BreakdownRow(name="Интернет", monthly=Decimal(500))]
+    validate_intervals(rows)
+
+
+def test_assign_periods_two_intervals():
+    rows = [
+        _interval_row("Интернет", "600", "15", 2026, 9),
+        _interval_row("Интернет", "900", "15", 2026, 9),
+    ]
+    assign_periods(rows)
+    assert rows[0].period_start == 1
+    assert rows[0].period_end == 15
+    assert rows[1].period_start == 16
+    assert rows[1].period_end == 30
+
+
+def test_assign_periods_three_intervals():
+    rows = [
+        _interval_row("Интернет", "600", "10", 2026, 9),
+        _interval_row("Интернет", "800", "10", 2026, 9),
+        _interval_row("Интернет", "900", "10", 2026, 9),
+    ]
+    assign_periods(rows)
+    assert (rows[0].period_start, rows[0].period_end) == (1, 10)
+    assert (rows[1].period_start, rows[1].period_end) == (11, 20)
+    assert (rows[2].period_start, rows[2].period_end) == (21, 30)
+
+
+def test_assign_periods_skips_fractional():
+    rows = [_interval_row("Интернет", "600", "15.5", 2026, 9)]
+    assign_periods(rows)
+    assert rows[0].period_start is None
+    assert rows[0].period_end is None
+
+
+def test_compute_totals_no_intervals():
+    rows = [
+        BreakdownRow(name="Интернет", monthly=Decimal(500)),
+        BreakdownRow(name="КТВ", monthly=Decimal(50)),
+    ]
+    current, charged = compute_totals(rows)
+    assert current == Decimal("550.00")
+    assert charged == Decimal("550.00")
+
+
+def test_compute_totals_two_intervals_same_service():
+    # Интернет 600/15 + 900/15 в сентябре.
+    # current = последняя = 900
+    # charged = 600*15/30 + 900*15/30 = 300 + 450 = 750
+    rows = [
+        _interval_row("Интернет", "600", "15", 2026, 9),
+        _interval_row("Интернет", "900", "15", 2026, 9),
+    ]
+    current, charged = compute_totals(rows)
+    assert current == Decimal("900.00")
+    assert charged == Decimal("750.00")
+
+
+def test_compute_totals_two_services_with_intervals():
+    rows = [
+        _interval_row("Интернет", "600", "15", 2026, 9),
+        _interval_row("Интернет", "900", "15", 2026, 9),
+        BreakdownRow(name="Аренда", monthly=Decimal(1)),
+    ]
+    current, charged = compute_totals(rows)
+    # current = 900 (последняя Интернета) + 1 (Аренда) = 901
+    # charged = 750 (Интернета) + 1 (Аренда) = 751
+    assert current == Decimal("901.00")
+    assert charged == Decimal("751.00")
+
+
+def test_compute_totals_filter_by_block():
+    rows = [
+        BreakdownRow(name="Интернет", monthly=Decimal(500)),
+        BreakdownRow(name="Интернет ДБ", monthly=Decimal(50), block=BlockType.VOLUNTARY),
+        BreakdownRow(name="Интернет ФБ", monthly=Decimal(150), block=BlockType.FINANCIAL),
+    ]
+    reg_cur, reg_chr = compute_totals(rows, BlockType.NONE)
+    db_cur, db_chr = compute_totals(rows, BlockType.VOLUNTARY)
+    fb_cur, fb_chr = compute_totals(rows, BlockType.FINANCIAL)
+    assert reg_chr == Decimal("500.00")
+    assert db_chr == Decimal("50.00")
+    assert fb_chr == Decimal("150.00")
+
+
+# ---------- paid_until_from_breakdown ----------
+
+
+def test_paid_until_no_intervals_fallback():
+    rows = [BreakdownRow(name="Интернет", monthly=Decimal(500))]
+    paid = paid_until_from_breakdown(
+        Decimal(500), rows, date(2026, 9, 18), fallback_monthly=Decimal(500)
+    )
+    assert paid == date(2026, 10, 17)
+
+
+def test_paid_until_empty_breakdown_uses_fallback():
+    paid = paid_until_from_breakdown(
+        Decimal(500), [], date(2026, 9, 18), fallback_monthly=Decimal(500)
+    )
+    assert paid == date(2026, 10, 17)
+
+
+def test_paid_until_single_interval_matches_regular():
+    rows = [_interval_row("Интернет", "500", "30", 2026, 9)]
+    paid = paid_until_from_breakdown(Decimal(500), rows, date(2026, 9, 18))
+    assert paid == date(2026, 10, 17)
+
+
+def test_paid_until_with_intervals_differs_from_average():
+    # Баланс 400, две ставки: 600/мес (1-15), 900/мес (16-30).
+    # С 25 сентября: 6 * (900/30) = 180. Остаток 220.
+    # Октябрь: 900/31 ≈ 29.03. Хватит на 7 дней → 7 октября.
+    rows = [
+        _interval_row("Интернет", "600", "15", 2026, 9),
+        _interval_row("Интернет", "900", "15", 2026, 9),
+    ]
+    paid = paid_until_from_breakdown(Decimal(400), rows, date(2026, 9, 25))
+    assert paid == date(2026, 10, 7)
+
+
+def test_paid_until_average_is_different():
+    # Средняя 750/мес: 6 * (750/30) = 150. Остаток 250.
+    # Октябрь: 750/31 ≈ 24.19. Хватит на 10 дней → 10 октября.
+    paid = calculate_paid_until(Decimal(400), Decimal(750), date(2026, 9, 25))
+    assert paid == date(2026, 10, 10)
+
+
+def test_paid_until_intervals_with_second_service():
+    rows = [
+        _interval_row("Интернет", "600", "15", 2026, 9),
+        _interval_row("Интернет", "900", "15", 2026, 9),
+        BreakdownRow(name="Аренда", monthly=Decimal(1)),
+    ]
+    paid = paid_until_from_breakdown(Decimal(400), rows, date(2026, 9, 25))
+    assert paid == date(2026, 10, 7)
+
+
+def test_paid_until_intervals_none_when_balance_zero():
+    rows = [
+        _interval_row("Интернет", "600", "15", 2026, 9),
+        _interval_row("Интернет", "900", "15", 2026, 9),
+    ]
+    assert paid_until_from_breakdown(Decimal(0), rows, date(2026, 9, 25)) is None
+
+
+def test_paid_until_intervals_negative_balance():
+    rows = [
+        _interval_row("Интернет", "600", "15", 2026, 9),
+        _interval_row("Интернет", "900", "15", 2026, 9),
+    ]
+    assert paid_until_from_breakdown(Decimal(-100), rows, date(2026, 9, 25)) is None

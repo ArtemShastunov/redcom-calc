@@ -5,11 +5,15 @@ import flet as ft
 
 from redcom_calc.cli.app import parse_block_tag
 from redcom_calc.domain.calculations import (
-    calculate_paid_until,
+    BreakdownRow,
+    assign_periods,
+    compute_totals,
     days_left,
     monthly_from_prorated,
     need_for_month,
+    paid_until_from_breakdown,
     parse_days_input,
+    validate_intervals,
     validate_price,
 )
 from redcom_calc.domain.models import (
@@ -156,7 +160,6 @@ def main(page: ft.Page):
 
     rows_column = ft.Column(spacing=8)
 
-    # --- режим total ---
     def _build_total_row(idx: int):
         total_field = ft.TextField(label="Абонплата в месяц, ₽", width=200)
         return {
@@ -164,7 +167,6 @@ def main(page: ft.Page):
             "row": ft.Row([total_field], spacing=12),
         }
 
-    # --- режим prorated ---
     def _build_prorated_row(idx: int):
         name_field = ft.TextField(
             label="Услуга",
@@ -194,7 +196,6 @@ def main(page: ft.Page):
             ),
         }
 
-    # --- режим services (тип + списание + дни) ---
     def _build_services_row(idx: int):
         type_dd = ft.Dropdown(
             label="Тип услуги",
@@ -330,12 +331,7 @@ def main(page: ft.Page):
             if isinstance(block, str):
                 flat.append(block)
                 result_column.controls.append(
-                    ft.Text(
-                        block,
-                        font_family="Consolas",
-                        size=12,
-                        selectable=True,
-                    )
+                    ft.Text(block, font_family="Consolas", size=12, selectable=True)
                 )
             else:
                 spans = []
@@ -348,12 +344,7 @@ def main(page: ft.Page):
                         spans.append(ft.TextSpan(text))
                 flat.append("".join(plain))
                 result_column.controls.append(
-                    ft.Text(
-                        spans=spans,
-                        font_family="Consolas",
-                        size=12,
-                        selectable=True,
-                    )
+                    ft.Text(spans=spans, font_family="Consolas", size=12, selectable=True)
                 )
         result_plain.clear()
         result_plain.extend(flat)
@@ -392,14 +383,39 @@ def main(page: ft.Page):
         ),
     )
 
-    # ---------- сбор данных ----------
+    def _render_breakdown_lines(breakdown: list[BreakdownRow]) -> list:
+        """Собрать строки разбивки с учётом периодов."""
+        blocks: list = []
+        for row in breakdown:
+            marker = _MARKER[row.block]
+            name_label = row.name
+            if row.period_start is not None and row.period_end is not None:
+                name_label += f" ({row.period_start}-{row.period_end}.{row.month:02d})"
+
+            parts: list = [
+                ("  • ", None),
+                (f"{name_label}{marker}: ", None),
+            ]
+            if row.was_changed:
+                parts.extend(
+                    [
+                        (f"{row.original_monthly}", _COLOR_RED),
+                        (" → ", None),
+                        (f"{row.monthly}", _COLOR_GREEN),
+                    ]
+                )
+            else:
+                parts.append((f"{row.monthly}", None))
+            parts.append((" ₽/мес", None))
+
+            if row.days_warning:
+                parts.append((f"   ⚠ {row.days_warning}", _COLOR_ORANGE))
+
+            blocks.append(parts)
+        return blocks
 
     def _collect_prorated(today: date):
-        rows_blocks: list = []
-        sum_regular = Decimal(0)
-        sum_db = Decimal(0)
-        sum_fb = Decimal(0)
-        total = Decimal(0)
+        breakdown: list[BreakdownRow] = []
 
         for r in rows_ref:
             raw_name = (r["name"].value or "").strip()
@@ -422,45 +438,40 @@ def main(page: ft.Page):
             monthly_raw = monthly_from_prorated(amount, days, year, month)
             check = validate_price(monthly_raw)
             monthly = check.rounded
-            total += monthly
 
-            marker = _MARKER[block]
-            parts: list = [("  • ", None), (f"{name}{marker}: ", None)]
-            if check.was_changed:
-                parts.extend(
-                    [
-                        (f"{check.original}", _COLOR_RED),
-                        (" → ", None),
-                        (f"{monthly}", _COLOR_GREEN),
-                    ]
+            breakdown.append(
+                BreakdownRow(
+                    name=name,
+                    monthly=monthly,
+                    block=block,
+                    days=days,
+                    year=year,
+                    month=month,
+                    original_monthly=check.original if check.was_changed else None,
+                    days_warning=days_warning,
                 )
-            else:
-                parts.append((f"{monthly}", None))
-            parts.append((" ₽/мес", None))
+            )
 
-            if days_warning:
-                parts.append((f"   ⚠ {days_warning}", _COLOR_ORANGE))
-
-            rows_blocks.append(parts)
-
-            if block is BlockType.NONE:
-                sum_regular += monthly
-            elif block is BlockType.VOLUNTARY:
-                sum_db += monthly
-            else:
-                sum_fb += monthly
-
-        if not rows_blocks:
+        if not breakdown:
             raise ValueError("Не добавлено ни одной строки.")
 
-        return total, sum_regular, sum_db, sum_fb, rows_blocks
+        validate_intervals(breakdown)
+        assign_periods(breakdown)
+
+        total_current, total_charged = compute_totals(breakdown)
+        lines = _render_breakdown_lines(breakdown)
+
+        return {
+            "total_current": total_current,
+            "total_charged": total_charged,
+            "total_full": total_current,
+            "lines": lines,
+            "breakdown": breakdown,
+        }
 
     def _collect_services(today: date):
-        rows_blocks: list = []
-        sum_regular = Decimal(0)
-        sum_db = Decimal(0)
-        sum_fb = Decimal(0)
-        total = Decimal(0)
+        breakdown: list[BreakdownRow] = []
+        services: list[Service] = []
 
         for r in rows_ref:
             typ = ServiceType(r["type"].value)
@@ -495,12 +506,10 @@ def main(page: ft.Page):
             except ValueError as exc:
                 raise ValueError(f"{name}: {exc}") from exc
 
-            # 1. Восстановить ставку из списания Fastcom
             monthly_from_fastcom = monthly_from_prorated(amount, days, year, month)
             check = validate_price(monthly_from_fastcom)
             monthly_rounded = check.rounded
 
-            # 2. Применить правила (фиксы): КТВ 50/150, домофон 100, телефон 180, ЦТВ в блоке 0, Интернет в блоке 50/150
             temp_svc = Service(
                 type=typ,
                 monthly_fee=monthly_rounded,
@@ -509,54 +518,37 @@ def main(page: ft.Page):
                 name=name,
             )
             monthly_final = monthly_rate_for_state(temp_svc)
-            rules_applied = monthly_final != monthly_rounded
+            services.append(temp_svc)
 
-            total += monthly_final
-
-            marker = _MARKER[block]
-            parts: list = [("  • ", None), (f"{name}{marker}: ", None)]
-
-            if rules_applied:
-                # Применён фикс — показываем исходное Fastcom, валидацию и фикс
-                parts.extend(
-                    [
-                        (f"{check.original}", _COLOR_RED),
-                        (" → ", None),
-                        (f"{monthly_final}", _COLOR_GREEN),
-                        (" ₽/мес", None),
-                        ("   (по правилу)", _COLOR_MUTED),
-                    ]
+            breakdown.append(
+                BreakdownRow(
+                    name=name,
+                    monthly=monthly_final,
+                    block=block,
+                    days=days,
+                    year=year,
+                    month=month,
+                    original_monthly=check.original if check.was_changed else None,
+                    days_warning=days_warning,
                 )
-            elif check.was_changed:
-                # Валидация исправила, фикса нет
-                parts.extend(
-                    [
-                        (f"{check.original}", _COLOR_RED),
-                        (" → ", None),
-                        (f"{monthly_final}", _COLOR_GREEN),
-                        (" ₽/мес", None),
-                    ]
-                )
-            else:
-                parts.append((f"{monthly_final}", None))
-                parts.append((" ₽/мес", None))
+            )
 
-            if days_warning:
-                parts.append((f"   ⚠ {days_warning}", _COLOR_ORANGE))
-
-            rows_blocks.append(parts)
-
-            if block is BlockType.NONE:
-                sum_regular += monthly_final
-            elif block is BlockType.VOLUNTARY:
-                sum_db += monthly_final
-            else:
-                sum_fb += monthly_final
-
-        if not rows_blocks:
+        if not breakdown:
             raise ValueError("Не добавлено ни одной услуги.")
 
-        return total, sum_regular, sum_db, sum_fb, rows_blocks
+        validate_intervals(breakdown)
+        assign_periods(breakdown)
+
+        total_current, total_charged = compute_totals(breakdown)
+        lines = _render_breakdown_lines(breakdown)
+
+        return {
+            "total_current": total_current,
+            "total_charged": total_charged,
+            "total_full": total_current,
+            "lines": lines,
+            "breakdown": breakdown,
+        }
 
     def calculate(e):
         try:
@@ -571,24 +563,35 @@ def main(page: ft.Page):
             return
 
         m = mode_ref["value"]
+        breakdown: list[BreakdownRow] = []
         try:
             if m == "total":
                 total = Decimal(rows_ref[0]["total"].value.strip().replace(",", "."))
-                full = total
-                sum_db = Decimal(0)
-                sum_fb = Decimal(0)
+                total_current = total
+                total_charged = total
+                total_full = total
                 lines = [f"Знаю итоговую сумму: {total} ₽"]
             elif m == "services":
-                total, full, sum_db, sum_fb, lines = _collect_services(today)
+                res = _collect_services(today)
+                total_current = res["total_current"]
+                total_charged = res["total_charged"]
+                total_full = res["total_full"]
+                lines = res["lines"]
+                breakdown = res["breakdown"]
             else:
-                total, full, sum_db, sum_fb, lines = _collect_prorated(today)
+                res = _collect_prorated(today)
+                total_current = res["total_current"]
+                total_charged = res["total_charged"]
+                total_full = res["total_full"]
+                lines = res["lines"]
+                breakdown = res["breakdown"]
         except (ValueError, InvalidOperation) as exc:
             page.open(ft.SnackBar(ft.Text(f"Ошибка: {exc}")))
             return
 
-        paid = calculate_paid_until(balance, total, today)
+        paid = paid_until_from_breakdown(balance, breakdown, today, fallback_monthly=total_charged)
         dl = days_left(paid, today)
-        need = need_for_month(balance, total)
+        need = need_for_month(balance, total_charged)
 
         out = []
         out.append("Результат расчёта")
@@ -596,12 +599,22 @@ def main(page: ft.Page):
         out.append("")
         out.extend(lines)
         out.append("")
-        out.append(f"Полная абонентская плата:  {full:>10} ₽")
-        if sum_db > 0:
-            out.append(f"Сумма за ДБ:               {sum_db:>10} ₽")
-        if sum_fb > 0:
-            out.append(f"Сумма за ФБ:               {sum_fb:>10} ₽")
-        out.append(f"Всего в месяц:             {total:>10} ₽")
+
+        if breakdown:
+            _, db_charged = compute_totals(breakdown, BlockType.VOLUNTARY)
+            _, fb_charged = compute_totals(breakdown, BlockType.FINANCIAL)
+
+            out.append(f"Абонентская плата (текущая):  {total_current:>10} ₽")
+            out.append(f"Начислено за месяц:           {total_charged:>10} ₽")
+            if total_full > total_current:
+                out.append(f"  при полном тарифе:          {total_full:>10} ₽")
+            if db_charged > 0:
+                out.append(f"Сумма за ДБ:                  {db_charged:>10} ₽")
+            if fb_charged > 0:
+                out.append(f"Сумма за ФБ:                  {fb_charged:>10} ₽")
+        else:
+            out.append(f"Абонплата в месяц:            {total_charged:>10} ₽")
+
         out.append("")
         out.append(f"Дата расчёта:              {today.isoformat()}")
         out.append(f"Баланс:                    {balance:>10} ₽")

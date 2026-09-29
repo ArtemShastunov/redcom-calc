@@ -5,13 +5,17 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from ..domain.calculations import (
-    calculate_paid_until,
+    BreakdownRow,
+    assign_periods,
+    compute_totals,
     days_left,
     monthly_from_prorated,
     monthly_total,
     monthly_total_full,
     need_for_month,
+    paid_until_from_breakdown,
     parse_days_input,
+    validate_intervals,
     validate_price,
 )
 from ..domain.models import BlockType, Service, ServiceState, ServiceType
@@ -48,7 +52,6 @@ _FB_MARKERS = frozenset({"фб", "fb"})
 
 
 def parse_block_tag(raw: str) -> tuple[str, BlockType]:
-    """Разобрать строку услуги: имя + метка ДБ/ФБ (если есть)."""
     text = raw.strip()
     if not text:
         return "без названия", BlockType.NONE
@@ -66,29 +69,16 @@ def parse_block_tag(raw: str) -> tuple[str, BlockType]:
 
 
 @dataclass
-class BreakdownRow:
-    name: str
-    monthly: Decimal
-    block: BlockType = BlockType.NONE
-    original_monthly: Decimal | None = None
-    days_used: Decimal | None = None
-    days_warning: str | None = None
-
-    @property
-    def was_changed(self) -> bool:
-        return self.original_monthly is not None and self.original_monthly != self.monthly
-
-
-@dataclass
 class CalcInput:
     today: date
     balance: Decimal
-    total: Decimal
+    total_current: Decimal
+    total_charged: Decimal
     total_full: Decimal
     breakdown: list[BreakdownRow] = field(default_factory=list)
 
 
-# ---------- примитивы ввода ----------
+# ---------- ввод ----------
 
 
 def _prompt_choice(title: str, options: list[tuple[object, str]]):
@@ -167,7 +157,6 @@ def _prompt_service() -> Service:
         )
 
     if type_ is ServiceType.KTV:
-        # КТВ: 50 ₽ без блока, 150 ₽ в блоке — по правилам компании.
         if state is ServiceState.BLOCK:
             monthly_fee = KTV_BLOCK_RATE
         else:
@@ -192,7 +181,13 @@ def _prompt_service() -> Service:
 
 def _collect_by_total(today: date, balance: Decimal) -> CalcInput:
     total = _prompt_decimal("Абонплата в месяц (₽)")
-    return CalcInput(today=today, balance=balance, total=total, total_full=total)
+    return CalcInput(
+        today=today,
+        balance=balance,
+        total_current=total,
+        total_charged=total,
+        total_full=total,
+    )
 
 
 def _collect_by_services(today: date, balance: Decimal) -> CalcInput:
@@ -217,10 +212,12 @@ def _collect_by_services(today: date, balance: Decimal) -> CalcInput:
         )
         for s in services
     ]
+    current = monthly_total(services)
     return CalcInput(
         today=today,
         balance=balance,
-        total=monthly_total(services),
+        total_current=current,
+        total_charged=current,
         total_full=monthly_total_full(services),
         breakdown=rows,
     )
@@ -261,8 +258,11 @@ def _collect_by_prorated(today: date, balance: Decimal) -> CalcInput:
                 name=name,
                 monthly=check.rounded,
                 block=block,
+                days=days,
+                year=year,
+                month=month,
                 original_monthly=check.original if check.was_changed else None,
-                days_used=days,
+                days_input=days,
                 days_warning=days_warning,
             )
         )
@@ -281,12 +281,20 @@ def _collect_by_prorated(today: date, balance: Decimal) -> CalcInput:
     if not rows:
         raise ValueError("Не добавлено ни одной строки — считать нечего.")
 
-    total = sum((r.monthly for r in rows), Decimal(0))
+    try:
+        validate_intervals(rows)
+    except ValueError as exc:
+        raise ValueError(f"Интервалы: {exc}") from exc
+
+    assign_periods(rows)
+    current, charged = compute_totals(rows)
+
     return CalcInput(
         today=today,
         balance=balance,
-        total=total,
-        total_full=total,
+        total_current=current,
+        total_charged=charged,
+        total_full=current,
         breakdown=rows,
     )
 
@@ -301,32 +309,28 @@ _MARKER = {
 
 
 def _print_result(inp: CalcInput) -> None:
-    paid = calculate_paid_until(inp.balance, inp.total, inp.today)
+    paid = paid_until_from_breakdown(
+        inp.balance, inp.breakdown, inp.today, fallback_monthly=inp.total_charged
+    )
     dl = days_left(paid, inp.today)
-    need = need_for_month(inp.balance, inp.total)
+    need = need_for_month(inp.balance, inp.total_charged)
 
     print("\n" + "=" * 60)
     print("  Результат расчёта")
     print("=" * 60)
 
     if inp.breakdown:
-        sum_regular = sum(
-            (r.monthly for r in inp.breakdown if r.block is BlockType.NONE),
-            Decimal(0),
-        )
-        sum_db = sum(
-            (r.monthly for r in inp.breakdown if r.block is BlockType.VOLUNTARY),
-            Decimal(0),
-        )
-        sum_fb = sum(
-            (r.monthly for r in inp.breakdown if r.block is BlockType.FINANCIAL),
-            Decimal(0),
-        )
+        _, reg_charged = compute_totals(inp.breakdown, BlockType.NONE)
+        _, db_charged = compute_totals(inp.breakdown, BlockType.VOLUNTARY)
+        _, fb_charged = compute_totals(inp.breakdown, BlockType.FINANCIAL)
 
         print("\nРазбивка:")
         for row in inp.breakdown:
             marker = _MARKER[row.block]
-            line = f"  • {row.name:<30} {marker:<6} → {row.monthly:>10} ₽/мес"
+            period = ""
+            if row.period_start is not None and row.period_end is not None:
+                period = f" ({row.period_start}-{row.period_end}.{row.month:02d})"
+            line = f"  • {row.name}{period} {marker:<6} → {row.monthly:>10} ₽/мес"
             if row.was_changed:
                 line += f"   (было {row.original_monthly})"
             print(line)
@@ -334,19 +338,19 @@ def _print_result(inp: CalcInput) -> None:
                 print(f"      ⚠ {row.days_warning}")
 
         print()
-        print(f"Полная абонентская плата:  {sum_regular:>10} ₽")
-        if sum_db > 0:
-            print(f"Сумма за ДБ:               {sum_db:>10} ₽")
-        if sum_fb > 0:
-            print(f"Сумма за ФБ:               {sum_fb:>10} ₽")
-        print(f"Всего в месяц:             {inp.total:>10} ₽")
+        print(f"Абонентская плата (текущая):  {inp.total_current:>10} ₽")
+        print(f"Начислено за месяц:           {inp.total_charged:>10} ₽")
+        if inp.total_full > inp.total_current:
+            print(f"  при полном тарифе:          {inp.total_full:>10} ₽")
+        if db_charged > 0:
+            print(f"Сумма за ДБ:                  {db_charged:>10} ₽")
+        if fb_charged > 0:
+            print(f"Сумма за ФБ:                  {fb_charged:>10} ₽")
 
     print(f"\nДата расчёта:              {inp.today.isoformat()}")
     print(f"Баланс:                    {inp.balance:>10} ₽")
     if not inp.breakdown:
-        print(f"Абонплата в месяц:         {inp.total:>10} ₽")
-    if inp.total_full > inp.total:
-        print(f"  при полном тарифе:       {inp.total_full:>10} ₽")
+        print(f"Абонплата в месяц:         {inp.total_charged:>10} ₽")
 
     if paid is None:
         print("Оплачено по:               —")
